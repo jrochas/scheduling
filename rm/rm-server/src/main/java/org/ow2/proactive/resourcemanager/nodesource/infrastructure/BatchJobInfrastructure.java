@@ -35,8 +35,8 @@ import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.security.KeyException;
-import java.util.Hashtable;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.HashMap;
+import java.util.Map;
 
 import org.objectweb.proactive.core.config.CentralPAPropertyRepository;
 import org.objectweb.proactive.core.node.Node;
@@ -150,29 +150,30 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
     protected String submitJobOpt;
 
     /**
-     * Shutdown flag
+     * Key to retrieve the shutdown flag
      */
-    protected boolean shutdown = false;
+    private static final String SHUTDOWN_FLAG_KEY = "shutdown";
 
     /**
-     * Credentials used by remote nodes to register to the NS
+     * Key to retrieve th credentials used by remote nodes to register to the NS
      */
-    private Credentials credentials = null;
+    private static final String CREDENTIALS_KEY = "credentials";
 
     /**
-     * Nodes currently up and running, nodeName -&gt; jobID
+     * Key to retrieve the map of the nodes currently up and running, nodeName -&gt; jobID
+     * This key is also used as a lock object when the map is accessed.
      */
-    private final Hashtable<String, String> currentNodes = new Hashtable<>();
+    private static final String CURRENT_NODES_KEY = "currentNodes";
 
     /**
-     * The number of pending nodes
+     * Key to retrieve the number of pending nodes
      */
-    private volatile Integer deployingNodes = 0;
+    private static final String DEPLOYING_NODES_KEY = "deployingNodes";
 
     /**
-     * To notify the control loop of the pending node timeout
+     * Key to retrieve the map that is used to notify the control loop of the pending node timeout
      */
-    private ConcurrentHashMap<String, Boolean> pnTimeout = new ConcurrentHashMap<>();
+    private static final String PN_TIMEOUT_KEY = "pnTimeout";
 
     /**
      * Acquires as much nodes as possible, making one distinct reservation per
@@ -180,11 +181,17 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
      */
     @Override
     public void acquireAllNodes() {
-        synchronized (currentNodes) {
+        writeLock.lock();
+        try {
             // deployingNodes and currentNodes updated in acquireNode
-            for (; (currentNodes.size() + deployingNodes) < maxNodes;) {
+            for (; (getCurrentNodesSize() + getNbDeployingNodes()) < maxNodes;) {
                 acquireNode();
             }
+        } catch (RuntimeException e) {
+            logger.error("Exception while acquiring a node: " + e.getMessage());
+            throw e;
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -194,16 +201,22 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
     @Override
     public void acquireNode() {
         final String bjs = getBatchinJobSystemName();
-        synchronized (currentNodes) {
-            int currentNodesSize = currentNodes.size();
-            if ((currentNodesSize + deployingNodes) >= maxNodes) {
+        writeLock.lock();
+        try {
+            int currentNodesSize = getCurrentNodesSize();
+            if ((currentNodesSize + getNbDeployingNodes()) >= maxNodes) {
                 logger.warn("Attempting to acquire nodes while maximum reached");
                 return;
             } else {
-                deployingNodes++;
+                incrementDeployingNodes();
             }
             logger.debug("Acquiring a new " + bjs + " node. # of current nodes: " + currentNodesSize +
-                         " - # of deploying nodes: " + deployingNodes);
+                         " - # of deploying nodes: " + getNbDeployingNodes());
+        } catch (RuntimeException e) {
+            logger.error("Exception while acquiring a node: " + e.getMessage());
+            throw e;
+        } finally {
+            writeLock.unlock();
         }
 
         // new thread: call will block until registration of the node to the RM
@@ -212,17 +225,17 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
                 try {
                     // currentNodes & deployingNodes are updated in startNode
                     startNode();
-                    logger.debug("new " + bjs + " Node acquired. # of current nodes: " + currentNodes.size() +
-                                 " - # of deploying nodes: " + deployingNodes);
+                    logger.debug("new " + bjs + " Node acquired. # of current nodes: " + getCurrentNodesSize() +
+                                 " - # of deploying nodes: " + getNbDeployingNodes());
                     return;
                 } catch (Exception e) {
                     logger.error("Could not acquire node ", e);
                 }
                 // deployment failed, one "deployingNodes" (volatile) not
                 // expected anymore...
-                deployingNodes--;
+                decrementDeployingNodes();
                 logger.debug("# of deploying nodes arranged given the last checked exception. # of current nodes: " +
-                             currentNodes.size() + " - # of deploying nodes: " + deployingNodes);
+                             getCurrentNodesSize() + " - # of deploying nodes: " + getNbDeployingNodes());
             }
         });
     }
@@ -244,12 +257,12 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
         String nodeName = getBatchinJobSystemName() + "-" + nodeSource.getName() + "-" + ProActiveCounter.getUniqID();
         clb.setNodeName(nodeName);
         clb.setJavaPath(this.javaPath);
-        clb.setRmURL(this.rmUrl);
+        clb.setRmURL(getRmUrl());
         clb.setRmHome(this.schedulingPath);
         clb.setSourceName(this.nodeSource.getName());
         clb.setPaProperties(this.javaOptions);
         try {
-            clb.setCredentialsValueAndNullOthers(new String(this.credentials.getBase64()));
+            clb.setCredentialsValueAndNullOthers(new String(getCredentials().getBase64()));
         } catch (KeyException e) {
             this.handleFailedDeployment(clb, e);
         }
@@ -279,7 +292,7 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
                                                     obfuscatedCmd,
                                                     "Deploying node on " + getBatchinJobSystemName() + " scheduler",
                                                     this.nodeTimeOut);
-        this.pnTimeout.put(dnURL, new Boolean(false));
+        putPnTimeout(dnURL, Boolean.FALSE);
 
         // executing the command
         Process p;
@@ -311,7 +324,7 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
                                      // Tries to wait for this node
                                      // registration...
         int circuitBreakerThreshold = 5;
-        while (!this.pnTimeout.get(dnURL) && circuitBreakerThreshold > 0) {
+        while (!getPnTimeout(dnURL) && circuitBreakerThreshold > 0) {
             try {
                 int exitCode = p.exitValue();
                 if (exitCode != 0 && !isJobIDValid) {
@@ -365,9 +378,9 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
           // threshold reached
 
         // the node is not expected anymore
-        if (pnTimeout.get(dnURL)) {
+        if (getPnTimeout(dnURL)) {
             // we remove it
-            this.pnTimeout.remove(dnURL);
+            removePnTimeout(dnURL);
             // removes the job
             this.deleteJob(this.extractSubmitOutput(id));
             // we destroy the process
@@ -496,7 +509,7 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
                 throw new IllegalArgumentException("Credentials must be specified");
             }
             try {
-                this.credentials = Credentials.getCredentialsBase64((byte[]) parameters[index++]);
+                setCredentials(Credentials.getCredentialsBase64((byte[]) parameters[index++]));
             } catch (KeyException e) {
                 throw new IllegalArgumentException("Could not retrieve base64 credentials", e);
             }
@@ -562,7 +575,7 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
      */
     @Override
     protected void notifyDeployingNodeLost(String pnURL) {
-        this.pnTimeout.put(pnURL, true);
+        putPnTimeout(pnURL, true);
     }
 
     /**
@@ -573,7 +586,7 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
         String deleteCmd = getDeleteJobCommand();
         String jobID = null;
         String nodeName = node.getNodeInformation().getName();
-        if ((jobID = currentNodes.get(nodeName)) != null) {
+        if ((jobID = getCurrentNode(nodeName)) != null) {
             try {
                 deleteJob(jobID);
             } catch (RMException e) {
@@ -582,10 +595,16 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
             }
             // atomic remove is important, furthermore we ensure consistent
             // trace
-            synchronized (currentNodes) {
-                currentNodes.remove(nodeName);
-                logger.debug("Node " + nodeName + " removed. # of current nodes: " + currentNodes.size() +
-                             " # of deploying nodes: " + deployingNodes);
+            writeLock.lock();
+            try {
+                removeCurrentNode(nodeName);
+                logger.debug("Node " + nodeName + " removed. # of current nodes: " + getCurrentNodesSize() +
+                             " # of deploying nodes: " + getNbDeployingNodes());
+            } catch (RuntimeException e) {
+                logger.error("Exception while removing a node: " + e.getMessage());
+                throw e;
+            } finally {
+                writeLock.unlock();
             }
         } else {
             logger.error("Node " + nodeName + " is not known as a Node belonging to this " +
@@ -664,21 +683,27 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
 
     @Override
     public void shutDown() {
-        shutdown = true;
+        setShutdown(true);
     }
 
     /**
      * Adds the given node's name and its associated jobID to the
-     * {@link #currentNodes} hashtable and decrements the number of deploying
+     * current node map and decrements the number of deploying
      * nodes.
      * 
      * @param nodeName
      * @param id
      */
     private void addNodeAndDecrementDeployingNode(String nodeName, String id) {
-        synchronized (currentNodes) {
-            currentNodes.put(nodeName, id);
-            deployingNodes--;
+        writeLock.lock();
+        try {
+            putCurrentNode(nodeName, id);
+            decrementDeployingNodes();
+        } catch (RuntimeException e) {
+            logger.error("Exception while moving a node from deploying to current: " + e.getMessage());
+            throw e;
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -778,5 +803,151 @@ public abstract class BatchJobInfrastructure extends InfrastructureManager {
      *         method is unable to compute the job's ID.
      */
     protected abstract String extractSubmitOutput(String output);
+
+    @Override
+    protected void initializeRuntimeVariables() {
+        runtimeVariables.put(SHUTDOWN_FLAG_KEY, false);
+        runtimeVariables.put(CREDENTIALS_KEY, null);
+        runtimeVariables.put(CURRENT_NODES_KEY, new HashMap<String, String>());
+        runtimeVariables.put(DEPLOYING_NODES_KEY, 0);
+        runtimeVariables.put(PN_TIMEOUT_KEY, new HashMap<String, Boolean>());
+    }
+
+    // Below are wrapper methods around the runtime variables map
+
+    private void setShutdown(final boolean isShutdown) {
+        setRuntimeVariable(new RuntimeVariablesHandler<Void>() {
+            @Override
+            public Void handle() {
+                runtimeVariables.put(SHUTDOWN_FLAG_KEY, isShutdown);
+                return null;
+            }
+        });
+    }
+
+    private Credentials getCredentials() {
+        return getRuntimeVariable(new RuntimeVariablesHandler<Credentials>() {
+            @Override
+            public Credentials handle() {
+                return (Credentials) runtimeVariables.get(CREDENTIALS_KEY);
+            }
+        });
+    }
+
+    private void setCredentials(final Credentials credentials) {
+        setRuntimeVariable(new RuntimeVariablesHandler<Void>() {
+            @Override
+            public Void handle() {
+                runtimeVariables.put(CREDENTIALS_KEY, credentials);
+                return null;
+            }
+        });
+    }
+
+    private void incrementDeployingNodes() {
+        setRuntimeVariable(new RuntimeVariablesHandler<Void>() {
+            @Override
+            public Void handle() {
+                int updated = (int) runtimeVariables.get(DEPLOYING_NODES_KEY) + 1;
+                runtimeVariables.put(DEPLOYING_NODES_KEY, updated);
+                return null;
+            }
+        });
+    }
+
+    private void decrementDeployingNodes() {
+        setRuntimeVariable(new RuntimeVariablesHandler<Void>() {
+            @Override
+            public Void handle() {
+                int updated = (int) runtimeVariables.get(DEPLOYING_NODES_KEY) - 1;
+                runtimeVariables.put(DEPLOYING_NODES_KEY, updated);
+                return null;
+            }
+        });
+    }
+
+    private int getNbDeployingNodes() {
+        return getRuntimeVariable(new RuntimeVariablesHandler<Integer>() {
+            @Override
+            public Integer handle() {
+                return (int) runtimeVariables.get(DEPLOYING_NODES_KEY);
+            }
+        });
+    }
+
+    private Map<String, String> getCurrentNodes() {
+        return (Map<String, String>) runtimeVariables.get(CURRENT_NODES_KEY);
+    }
+
+    private String getCurrentNode(final String key) {
+        return getRuntimeVariable(new RuntimeVariablesHandler<String>() {
+            @Override
+            public String handle() {
+                return getCurrentNodes().get(key);
+            }
+        });
+    }
+
+    private int getCurrentNodesSize() {
+        return getRuntimeVariable(new RuntimeVariablesHandler<Integer>() {
+            @Override
+            public Integer handle() {
+                return getCurrentNodes().size();
+            }
+        });
+    }
+
+    private void putCurrentNode(final String key, final String value) {
+        setRuntimeVariable(new RuntimeVariablesHandler<Void>() {
+            @Override
+            public Void handle() {
+                getCurrentNodes().put(key, value);
+                return null;
+            }
+        });
+    }
+
+    private void removeCurrentNode(final String key) {
+        setRuntimeVariable(new RuntimeVariablesHandler<Void>() {
+            @Override
+            public Void handle() {
+                getCurrentNodes().remove(key);
+                return null;
+            }
+        });
+    }
+
+    private Map<String, Boolean> getPnTimeoutMap() {
+        return (Map<String, Boolean>) runtimeVariables.get(PN_TIMEOUT_KEY);
+    }
+
+    private Boolean getPnTimeout(final String key) {
+        return getRuntimeVariable(new RuntimeVariablesHandler<Boolean>() {
+            @Override
+            public Boolean handle() {
+                return getPnTimeoutMap().get(key);
+            }
+        });
+    }
+
+    private void putPnTimeout(final String key, final Boolean value) {
+        setRuntimeVariable(new RuntimeVariablesHandler<Void>() {
+            @Override
+            public Void handle() {
+                getPnTimeoutMap().put(key, value);
+                return null;
+            }
+        });
+    }
+
+    private void removePnTimeout(final String key) {
+        setRuntimeVariable(new RuntimeVariablesHandler<Void>() {
+            @Override
+            public Void handle() {
+                getPnTimeoutMap().remove(key);
+                return null;
+            }
+        });
+    }
 
 }
