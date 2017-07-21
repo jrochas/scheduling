@@ -292,6 +292,7 @@ public class LocalInfrastructure extends InfrastructureManager {
 
         try {
             this.maxNodes = Integer.parseInt(args[index++].toString());
+            runtimeVariables.put(NB_HANDLED_NODES_KEY, maxNodes);
         } catch (Exception e) {
             throw new IllegalArgumentException("Cannot determine max node");
         }
@@ -320,19 +321,18 @@ public class LocalInfrastructure extends InfrastructureManager {
 
     @Override
     public void removeNode(Node node) throws RMException {
-        logger.debug("Removing node " + node.getNodeInformation().getURL() + " from " +
+        logger.debug("A node is removed " + node.getNodeInformation().getURL() + " from " +
                      this.getClass().getSimpleName());
+        // the node was removed intentionally, so we decrement the number of handled nodes
+        decrementHandledNodes();
+        // and the number of acquired nodes is decremented too
+        removeAcquiredNodesAndShutDownIfNeeded();
+    }
 
-        if (!this.nodeSource.getDownNodes().contains(node)) {
-            // the node was manually removed
-            decrementHandledNodes();
-        }
-
-        int remainingNodesCount = decrementAndGetAcquiredNodes();
-        // If there is no remaining node, kill the JVM process
-        if (remainingNodesCount == 0 && getCommandLineStarted()) {
-            shutDown();
-        }
+    @Override
+    public void notifyDownNode(String nodeName, String nodeUrl, Node node) {
+        logger.debug("A down node is removed: " + nodeUrl + " from " + this.getClass().getSimpleName());
+        removeAcquiredNodesAndShutDownIfNeeded();
     }
 
     @Override
@@ -361,6 +361,14 @@ public class LocalInfrastructure extends InfrastructureManager {
         runtimeVariables.put(NB_LOST_NODES_KEY, 0);
         runtimeVariables.put(COMMAND_LINE_STARTED_KEY, false);
         runtimeVariables.put(NB_HANDLED_NODES_KEY, maxNodes);
+    }
+
+    private void removeAcquiredNodesAndShutDownIfNeeded() {
+        int remainingNodesCount = decrementAndGetAcquiredNodes();
+        // if there is no remaining node, kill the JVM process
+        if (remainingNodesCount == 0 && getCommandLineStarted()) {
+            shutDown();
+        }
     }
 
     // Below are wrapper methods around the runtime variables map
