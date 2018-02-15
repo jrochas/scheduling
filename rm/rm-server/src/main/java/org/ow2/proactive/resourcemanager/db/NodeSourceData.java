@@ -72,6 +72,10 @@ public class NodeSourceData implements Serializable {
     public NodeSourceData() {
     }
 
+    public NodeSourceData(String name) {
+        this.name = name;
+    }
+
     public NodeSourceData(String nodeSourceName, String infrastructureType, Object[] infrastructureParameters,
             String policyType, Object[] policyParameters, Client provider, boolean nodesRecoverable) {
 
