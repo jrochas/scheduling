@@ -72,7 +72,15 @@ public class NodeSourceData implements Serializable {
     public NodeSourceData() {
     }
 
-    public NodeSourceData(String name) {
+    /**
+     * @param name
+     * @return create NodeSourceData with only one attribute name
+     */
+    public static NodeSourceData createNodeSourceDataOnlyWithName(String name) {
+        return new NodeSourceData(name);
+    }
+
+    private NodeSourceData(String name) {
         this.name = name;
     }
 
