@@ -63,6 +63,7 @@ public class KeyPairProducer {
                 }
             }
         });
+        thread.setName(KeyPairProducer.class.getName());
         thread.setDaemon(true);
         thread.start();
     }
