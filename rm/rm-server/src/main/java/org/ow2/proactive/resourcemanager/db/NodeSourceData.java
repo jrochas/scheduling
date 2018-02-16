@@ -29,6 +29,7 @@ import java.io.Serializable;
 import java.util.HashMap;
 import java.util.Map;
 
+import javax.persistence.Cacheable;
 import javax.persistence.Column;
 import javax.persistence.Entity;
 import javax.persistence.Id;
@@ -43,6 +44,7 @@ import org.ow2.proactive.resourcemanager.authentication.Client;
 
 
 @Entity
+@Cacheable
 @NamedQueries({ @NamedQuery(name = "deleteNodeSourceDataByName", query = "delete from NodeSourceData where name=:name"),
                 @NamedQuery(name = "deleteAllNodeSourceData", query = "delete from NodeSourceData"),
                 @NamedQuery(name = "getNodeSourceData", query = "from NodeSourceData"),
